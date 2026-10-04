@@ -190,6 +190,15 @@ pub(crate) fn init_bitcoind(
                                   // electrs 0.9.11 (used in the electrum-only test) still expects a string and falls over.
                                   // The deprecation flag restores the legacy single-string format.
     conf.args.push("-deprecatedrpc=warnings");
+    // P2P is needed only for electrs to connect to the regtest node. These
+    // tests run against local daemons, so keep the listener loopback-only and
+    // disable peer/address discovery and automatic port mapping.
+    conf.args.push("-bind=127.0.0.1");
+    conf.args.push("-discover=0");
+    conf.args.push("-dnsseed=0");
+    conf.args.push("-fixedseeds=0");
+    conf.args.push("-listenonion=0");
+    conf.args.push("-upnp=0");
     let raw_tx = format!("-zmqpubrawtx={}", zmq_addr);
     conf.args.push(&raw_tx);
     let block_hash = format!("-zmqpubrawblock={}", zmq_addr);

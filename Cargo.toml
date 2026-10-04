@@ -75,6 +75,11 @@ lightning = ["dep:ldk-server-client", "dep:tokio", "dep:lightning-invoice"]
 [package.metadata.cargo-machete]
 ignored = ["rustls"]
 
+# electrsd 0.28.0 probes its Electrum wildcard bind address as a destination;
+# Windows rejects connections to 0.0.0.0. The local patch uses loopback.
+[patch.crates-io]
+electrsd = { path = "vendor/electrsd" }
+
 # Lightning examples only build with the `lightning` feature enabled.
 [[example]]
 name = "ldk_smoke"
