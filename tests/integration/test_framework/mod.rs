@@ -165,7 +165,22 @@ fn install_bitcoind(archive_bytes: &[u8], bitcoind_path: &Path) {
         unpack_tarball(archive_bytes, &temporary_path);
     }
     std::fs::rename(&temporary_path, bitcoind_path).unwrap();
+    // `File::create` does not keep the archive mode. Without this, Linux
+    // refuses to spawn the extracted bitcoind (the old `unpack_in` path kept
+    // the tarball's 0755 bit). Windows executes by `.exe` extension.
+    ensure_bitcoind_executable(bitcoind_path);
 }
+
+#[cfg(unix)]
+fn ensure_bitcoind_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(permissions.mode() | 0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(not(unix))]
+fn ensure_bitcoind_executable(_path: &Path) {}
 
 fn get_bitcoind_filename(os: &str, arch: &str) -> String {
     match (os, arch) {
@@ -251,6 +266,10 @@ pub(crate) fn init_bitcoind(
                 .output()
                 .expect("Failed to sign bitcoind binary");
         }
+    } else {
+        // A binary extracted by an older copy may already be on disk without
+        // the execute bit. Re-applying it is a no-op on Windows.
+        ensure_bitcoind_executable(&bitcoind_path);
     }
 
     env::set_var("BITCOIND_EXE", &bitcoind_path);
@@ -941,27 +960,41 @@ fn warm_up_onion(cfg: &ElectrumConfig) {
 /// electrs syncs asynchronously, so a wallet sync right after mining can read
 /// a stale tip and cache UTXOs with outdated confirmation counts — which then
 /// differs from a wallet synced after electrs caught up, failing equality
-/// assertions. `trigger()` (SIGUSR1) nudges electrs to sync on each poll.
+/// assertions. `trigger()` (SIGUSR1) nudges electrs to sync on each poll. On
+/// Windows that signal does not exist, so the poll itself is the wait.
+///
+/// electrs 0.10 accepts TCP before RocksDB can answer and returns
+/// `-32603 unavailable index`. That is a protocol error, so a single
+/// `Electrum::new` must not be fatal here.
 #[allow(dead_code)]
 pub fn wait_for_electrs_tip(bitcoind: &BitcoinD, electrsd: &ElectrsD, cfg: &ElectrumConfig) {
     let expected = bitcoind.client.get_block_count().unwrap();
-    let probe = Electrum::new(cfg).unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut next_log = Instant::now();
     loop {
         let _ = electrsd.trigger();
-        if probe
-            .get_block_count()
-            .map(|tip| tip >= expected)
-            .unwrap_or(false)
-        {
+        let indexed = match Electrum::new(cfg) {
+            Ok(probe) => probe
+                .get_block_count()
+                .map(|tip| tip >= expected)
+                .unwrap_or(false),
+            Err(error) => {
+                if Instant::now() >= next_log {
+                    log::info!("electrs index not ready yet: {error:?}");
+                    next_log = Instant::now() + Duration::from_secs(2);
+                }
+                false
+            }
+        };
+        if indexed {
             return;
         }
         assert!(
-            std::time::Instant::now() < deadline,
-            "electrs did not reach tip {} within 60s",
-            expected
+            Instant::now() < deadline,
+            "electrs did not reach tip {expected} within 120s",
+            expected = expected
         );
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -1244,11 +1277,14 @@ impl TestFramework {
                     return url.clone();
                 }
                 let e = init_electrsd(&bitcoind, &temp_dir);
-                // Give electrs a moment to index the 101 blocks bitcoind has already mined.
-                thread::sleep(Duration::from_secs(2));
-                let _ = e.trigger();
-                thread::sleep(Duration::from_secs(1));
                 let url = format!("tcp://{}", e.electrum_url);
+                let cfg = ElectrumConfig {
+                    url: url.clone(),
+                    ..Default::default()
+                };
+                // Wallet init queries electrs immediately. Wait until the
+                // index can actually answer, not just until the port accepts.
+                wait_for_electrs_tip(&bitcoind, &e, &cfg);
                 electrsd = Some(e);
                 electrum_url = Some(url.clone());
                 url
