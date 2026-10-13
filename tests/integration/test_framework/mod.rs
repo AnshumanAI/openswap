@@ -27,7 +27,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
 
 use flate2::read::GzDecoder;
@@ -38,7 +37,6 @@ use bitcoind::{
     BitcoinD,
 };
 
-use electrsd::ElectrsD;
 use log::info;
 use openswap::{
     maker::{start_server, MakerBehavior, MakerServer, MakerServerConfig},
@@ -152,23 +150,47 @@ fn unpack_zip(zip_bytes: &[u8], temporary_exe: &Path) {
 
 /// Install `bitcoind` only after the bytes are fully on disk.
 ///
-/// A failed copy leaves `bitcoind.tmp` and not the final executable, so the
-/// next run retries extraction instead of launching a partial binary.
+/// Staging is unique per process. A shared `bitcoind.tmp` lets parallel tests
+/// truncate the same file and rename a partial binary. If another process
+/// already installed a complete executable, that winner is kept.
 fn install_bitcoind(archive_bytes: &[u8], bitcoind_path: &Path) {
     if let Some(parent) = bitcoind_path.parent() {
         create_dir_all(parent).unwrap();
     }
-    let temporary_path = bitcoind_path.with_extension("tmp");
+    if installed_executable(bitcoind_path) {
+        ensure_bitcoind_executable(bitcoind_path);
+        return;
+    }
+    let file_name = bitcoind_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("bitcoind");
+    let temporary_path = bitcoind_path.with_file_name(format!(
+        ".{file_name}.{}.{}.partial",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
     if archive_bytes.starts_with(b"PK") {
         unpack_zip(archive_bytes, &temporary_path);
     } else {
         unpack_tarball(archive_bytes, &temporary_path);
     }
-    std::fs::rename(&temporary_path, bitcoind_path).unwrap();
     // `File::create` does not keep the archive mode. Without this, Linux
     // refuses to spawn the extracted bitcoind (the old `unpack_in` path kept
     // the tarball's 0755 bit). Windows executes by `.exe` extension.
+    ensure_bitcoind_executable(&temporary_path);
+    match std::fs::rename(&temporary_path, bitcoind_path) {
+        Ok(()) => {}
+        Err(_) if installed_executable(bitcoind_path) => {
+            let _ = std::fs::remove_file(&temporary_path);
+        }
+        Err(error) => panic!("failed to install bitcoind: {}", error),
+    }
     ensure_bitcoind_executable(bitcoind_path);
+}
+
+fn installed_executable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0)
 }
 
 #[cfg(unix)]
@@ -287,24 +309,146 @@ pub(crate) fn init_bitcoind(
     Ok(bitcoind)
 }
 
+/// Owns the electrs child for one test.
+///
+/// Unix uses crates.io `electrsd`. Windows spawns `ELECTRS_EXEC` itself:
+/// electrsd 0.28.0 binds `0.0.0.0` and then connects to that address, which
+/// Windows rejects. Spawning here uses loopback instead of vendoring the crate.
+pub(crate) struct TestElectrs {
+    /// `host:port` of the Electrum RPC, without a scheme.
+    pub electrum_url: String,
+    inner: TestElectrsInner,
+}
+
+enum TestElectrsInner {
+    #[cfg(unix)]
+    Managed(electrsd::ElectrsD),
+    #[cfg(windows)]
+    Spawned(Child),
+}
+
+impl TestElectrs {
+    /// Ask electrs to sync. No-op on Windows, which has no `SIGUSR1`.
+    pub fn trigger(&self) {
+        #[cfg(unix)]
+        if let TestElectrsInner::Managed(electrs) = &self.inner {
+            let _ = electrs.trigger();
+        }
+    }
+}
+
+impl Drop for TestElectrs {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        match &mut self.inner {
+            TestElectrsInner::Spawned(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
 /// Spawn an electrs process attached to `bitcoind`. The bitcoind instance must
 /// have been started with P2P enabled (see [`init_bitcoind`] which now does so).
 ///
-/// The returned [`ElectrsD`] owns the electrs child process and kills it on drop.
+/// The returned value owns the electrs child process and kills it on drop.
 #[allow(dead_code)]
-pub(crate) fn init_electrsd(bitcoind: &BitcoinD, datadir: &std::path::Path) -> ElectrsD {
-    let exe = electrsd::exe_path().expect(
-        "no electrs binary available: set ELECTRS_EXEC or enable the electrs_0_9_11 feature",
-    );
-    let mut conf = electrsd::Conf::default();
+pub(crate) fn init_electrsd(bitcoind: &BitcoinD, datadir: &std::path::Path) -> TestElectrs {
+    #[cfg(windows)]
+    {
+        spawn_windows_electrs(bitcoind, datadir)
+    }
+    #[cfg(unix)]
+    {
+        let exe = electrsd::exe_path().expect(
+            "no electrs binary available: set ELECTRS_EXEC or enable the electrs_0_9_11 feature",
+        );
+        let mut conf = electrsd::Conf::default();
+        let electrs_dir = datadir.join("electrs");
+        std::fs::create_dir_all(&electrs_dir).ok();
+        conf.staticdir = Some(electrs_dir);
+        // Surface electrs stderr only when explicitly requested via env var, to keep test output clean.
+        conf.view_stderr = std::env::var("ELECTRS_LOG").is_ok();
+        let electrs =
+            electrsd::ElectrsD::with_conf(exe, bitcoind, &conf).expect("failed to spawn electrs");
+        log::info!("🔌 electrs spawned at {}", electrs.electrum_url);
+        TestElectrs {
+            electrum_url: electrs.electrum_url.clone(),
+            inner: TestElectrsInner::Managed(electrs),
+        }
+    }
+}
+
+/// Spawn electrs on loopback. electrsd 0.28.0 cannot do this on Windows.
+#[cfg(windows)]
+fn spawn_windows_electrs(bitcoind: &BitcoinD, datadir: &Path) -> TestElectrs {
+    let exe = env::var("ELECTRS_EXEC")
+        .unwrap_or_else(|_| panic!("no electrs binary available: set ELECTRS_EXEC"));
     let electrs_dir = datadir.join("electrs");
     std::fs::create_dir_all(&electrs_dir).ok();
-    conf.staticdir = Some(electrs_dir);
-    // Surface electrs stderr only when explicitly requested via env var, to keep test output clean.
-    conf.view_stderr = std::env::var("ELECTRS_LOG").is_ok();
-    let electrsd = ElectrsD::with_conf(exe, bitcoind, &conf).expect("failed to spawn electrs");
-    log::info!("🔌 electrs spawned at {}", electrsd.electrum_url);
-    electrsd
+    let electrum_port = TcpListener::bind(("127.0.0.1", 0))
+        .expect("OS refused a free port")
+        .local_addr()
+        .unwrap()
+        .port();
+    let monitor_port = TcpListener::bind(("127.0.0.1", 0))
+        .expect("OS refused a free port")
+        .local_addr()
+        .unwrap()
+        .port();
+    let electrum_url = format!("127.0.0.1:{electrum_port}");
+    let db_dir = electrs_dir.display().to_string();
+    let cookie = bitcoind.params.cookie_file.display().to_string();
+    let rpc = bitcoind.params.rpc_socket.to_string();
+    let p2p = bitcoind
+        .params
+        .p2p_socket
+        .expect("electrs requires bitcoind with p2p port open")
+        .to_string();
+    let monitor = format!("127.0.0.1:{monitor_port}");
+    let mut command = Command::new(&exe);
+    command.args([
+        "--db-dir",
+        &db_dir,
+        "--network",
+        "regtest",
+        "--cookie-file",
+        &cookie,
+        "--daemon-rpc-addr",
+        &rpc,
+        "--daemon-p2p-addr",
+        &p2p,
+        "--electrum-rpc-addr",
+        &electrum_url,
+        "--monitoring-addr",
+        &monitor,
+    ]);
+    if env::var("ELECTRS_LOG").is_err() {
+        command.stderr(Stdio::null()).stdout(Stdio::null());
+    }
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to spawn electrs '{}': {}", exe, error));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().ok().flatten() {
+            panic!("electrs exited before accepting connections: {}", status);
+        }
+        if std::net::TcpStream::connect(&electrum_url).is_ok() {
+            break;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("electrs did not accept connections on {}", electrum_url);
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    log::info!("🔌 electrs spawned at {electrum_url}");
+    TestElectrs {
+        electrum_url,
+        inner: TestElectrsInner::Spawned(child),
+    }
 }
 
 /// Generate Blocks in regtest node.
@@ -967,12 +1111,12 @@ fn warm_up_onion(cfg: &ElectrumConfig) {
 /// `-32603 unavailable index`. That is a protocol error, so a single
 /// `Electrum::new` must not be fatal here.
 #[allow(dead_code)]
-pub fn wait_for_electrs_tip(bitcoind: &BitcoinD, electrsd: &ElectrsD, cfg: &ElectrumConfig) {
+pub fn wait_for_electrs_tip(bitcoind: &BitcoinD, electrsd: &TestElectrs, cfg: &ElectrumConfig) {
     let expected = bitcoind.client.get_block_count().unwrap();
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut next_log = Instant::now();
     loop {
-        let _ = electrsd.trigger();
+        electrsd.trigger();
         let indexed = match Electrum::new(cfg) {
             Ok(probe) => probe
                 .get_block_count()
@@ -1052,7 +1196,10 @@ pub struct TestFramework {
     /// Present only when the backend in [`TestFramework::init`] asks for an Electrum URL.
     /// Kept alive here so the electrs child process lives for the duration of the test.
     /// Behind a `Mutex` so teardown can drop it before bitcoind, from `&self`.
-    pub(super) electrsd: Mutex<Option<ElectrsD>>,
+    pub(super) electrsd: Mutex<Option<TestElectrs>>,
+    /// Datadir of the bitcoind that actually started. Retries do not reuse a
+    /// directory a leaked node may still have locked.
+    pub(super) bitcoind_datadir: PathBuf,
     pub(super) temp_dir: PathBuf,
     pub(super) nostr_relay_url: String,
     /// Kept so [`TestFramework::taker_init_config`] can rebuild the same backend
@@ -1082,6 +1229,7 @@ enum TestNostrRelay {
 struct EmbeddedRelay {
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl Drop for TestNostrRelay {
@@ -1097,6 +1245,10 @@ impl Drop for TestNostrRelay {
                 relay.shutdown.store(true, Relaxed);
                 if let Some(handle) = relay.thread.take() {
                     let _ = handle.join();
+                }
+                let workers = std::mem::take(&mut *relay.workers.lock().unwrap());
+                for worker in workers {
+                    let _ = worker.join();
                 }
             }
         }
@@ -1243,12 +1395,15 @@ impl TestFramework {
             .unwrap_or(log::LevelFilter::Debug);
         setup_logger(log_level, Some(temp_dir.clone()));
         log::info!("📁 temporary directory : {}", temp_dir.display());
-        let (bitcoind, zmq_addr) = (0..3)
-            .find_map(|_| {
+        // A failed `BitcoinD::with_conf` can leave the child running. Reusing
+        // that datadir makes the next port attempt die on the lock.
+        let (bitcoind, zmq_addr, bitcoind_datadir) = (0..3)
+            .find_map(|attempt| {
+                let parent = temp_dir.join(format!("bitcoind-{attempt}"));
                 let zmq_addr = format!("tcp://127.0.0.1:{}", free_ports(1)[0]);
-                init_bitcoind(&temp_dir, zmq_addr.clone())
+                init_bitcoind(&parent, zmq_addr.clone())
                     .ok()
-                    .map(|b| (b, zmq_addr))
+                    .map(|node| (node, zmq_addr, parent.join(".bitcoin")))
             })
             .expect("bitcoind failed to start on three fresh ZMQ ports");
         let rpc_config = CoreRpcConfig {
@@ -1269,7 +1424,7 @@ impl TestFramework {
             })
             .expect("nostr relay failed to start on three fresh ports");
         let nostr_relay_url = format!("ws://127.0.0.1:{nostr_port}");
-        let mut electrsd: Option<ElectrsD> = None;
+        let mut electrsd: Option<TestElectrs> = None;
         let (takers, makers) = {
             let mut electrum_url: Option<String> = None;
             let mut ensure_electrum_url = || -> String {
@@ -1375,6 +1530,7 @@ impl TestFramework {
         let framework = Arc::new(Self {
             bitcoind,
             electrsd: Mutex::new(electrsd),
+            bitcoind_datadir,
             temp_dir: temp_dir.clone(),
             nostr_relay_url: nostr_relay_url.clone(),
             zmq_addr,
@@ -1403,7 +1559,7 @@ impl TestFramework {
             if !tf.block_gen_paused.load(Relaxed) {
                 generate_blocks(&tf.bitcoind, blocks_per_tick);
                 if let Some(elec) = tf.electrsd.lock().unwrap().as_ref() {
-                    let _ = elec.trigger();
+                    elec.trigger();
                 }
             }
         });
@@ -1652,7 +1808,7 @@ fn spawn_nostr_relay(temp_dir: &Path, port: u16) -> TestNostrRelay {
     #[cfg(windows)]
     {
         let _ = temp_dir;
-        return spawn_embedded_nostr_relay(port);
+        spawn_embedded_nostr_relay(port)
     }
     #[cfg(not(windows))]
     {
@@ -1700,15 +1856,23 @@ fn spawn_embedded_nostr_relay(port: u16) -> TestNostrRelay {
         .expect("embedded nostr relay accept should not block shutdown");
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_thread = Arc::clone(&shutdown);
-    let thread = thread::spawn(move || embedded_nostr_relay_loop(listener, shutdown_thread));
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let workers_thread = Arc::clone(&workers);
+    let thread =
+        thread::spawn(move || embedded_nostr_relay_loop(listener, shutdown_thread, workers_thread));
     TestNostrRelay::Embedded(EmbeddedRelay {
         shutdown,
         thread: Some(thread),
+        workers,
     })
 }
 
 #[cfg(windows)]
-fn embedded_nostr_relay_loop(listener: TcpListener, shutdown: Arc<AtomicBool>) {
+fn embedded_nostr_relay_loop(
+    listener: TcpListener,
+    shutdown: Arc<AtomicBool>,
+    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+) {
     use std::sync::{atomic::AtomicU64, mpsc};
 
     use nostr::{filter::MatchEventOptions, ClientMessage, Event, Filter, JsonUtil, RelayMessage};
@@ -1736,7 +1900,11 @@ fn embedded_nostr_relay_loop(listener: TcpListener, shutdown: Arc<AtomicBool>) {
             Ok((stream, _)) => {
                 let hub = Arc::clone(&hub);
                 let conn = next_conn.fetch_add(1, Relaxed);
-                thread::spawn(move || embedded_nostr_connection(stream, hub, conn));
+                let shutdown_conn = Arc::clone(&shutdown);
+                let worker = thread::spawn(move || {
+                    embedded_nostr_connection(stream, hub, conn, shutdown_conn)
+                });
+                workers.lock().unwrap().push(worker);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
@@ -1755,7 +1923,12 @@ fn embedded_nostr_relay_loop(listener: TcpListener, shutdown: Arc<AtomicBool>) {
                 .any(|filter| filter.match_event(event, MatchEventOptions::new()))
     }
 
-    fn embedded_nostr_connection(stream: std::net::TcpStream, hub: Arc<Mutex<Hub>>, conn: u64) {
+    fn embedded_nostr_connection(
+        stream: std::net::TcpStream,
+        hub: Arc<Mutex<Hub>>,
+        conn: u64,
+        shutdown: Arc<AtomicBool>,
+    ) {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
         let mut socket = match tungstenite::accept(stream) {
             Ok(socket) => socket,
@@ -1767,6 +1940,10 @@ fn embedded_nostr_relay_loop(listener: TcpListener, shutdown: Arc<AtomicBool>) {
         let (tx, rx) = mpsc::channel::<String>();
 
         loop {
+            if shutdown.load(Relaxed) {
+                let _ = socket.close(None);
+                break;
+            }
             while let Ok(frame) = rx.try_recv() {
                 if socket.send(tungstenite::Message::text(frame)).is_err() {
                     hub.lock().unwrap().subs.retain(|sub| sub.conn != conn);

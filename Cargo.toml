@@ -56,12 +56,9 @@ tar = {version = "0.4.43"}
 zip = "2"
 
 # `electrs_0_9_11` downloads a Unix binary in the build script, which does not
-# compile on Windows. Windows tests supply `ELECTRS_EXEC` instead.
+# compile on Windows. Windows tests spawn `ELECTRS_EXEC` themselves.
 [target.'cfg(unix)'.dev-dependencies]
 electrsd = { version = "0.28", features = ["electrs_0_9_11"] }
-
-[target.'cfg(windows)'.dev-dependencies]
-electrsd = { version = "0.28" }
 
 #Empty default feature set, (helpful to generalise in github actions)
 [features]
@@ -74,11 +71,6 @@ lightning = ["dep:ldk-server-client", "dep:tokio", "dep:lightning-invoice"]
 
 [package.metadata.cargo-machete]
 ignored = ["rustls"]
-
-# electrsd 0.28.0 probes its Electrum wildcard bind address as a destination;
-# Windows rejects connections to 0.0.0.0. The local patch uses loopback.
-[patch.crates-io]
-electrsd = { path = "vendor/electrsd" }
 
 # Lightning examples only build with the `lightning` feature enabled.
 [[example]]

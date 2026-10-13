@@ -411,9 +411,6 @@ impl WalletStore {
         let encrypted = encrypt_struct(self, store_enc_material)
             .map_err(|e| WalletError::General(format!("wallet store encryption failed: {e:?}")))?;
         let bytes = serde_cbor::to_vec(&encrypted)?;
-        // Flush and replace through the shared helper. Opening the parent
-        // directory to sync it fails on Windows, so durability is platform-specific
-        // inside `write_bytes_atomically`.
         crate::atomic_file::write_bytes_atomically(path, &bytes)?;
         Ok(())
     }

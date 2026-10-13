@@ -83,7 +83,11 @@ pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()
     let parent = parent_dir(path);
     std::fs::create_dir_all(parent)?;
 
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    // `.tmp*` would also hide a real wallet named `.tmp-savings` from
+    // report discovery. This prefix is reserved for the writer.
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".openswap-staging-")
+        .tempfile_in(parent)?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
     // Close the handle before the replace. Windows rejects a move of a file
